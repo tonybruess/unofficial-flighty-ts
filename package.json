@@ -1,0 +1,52 @@
+{
+  "name": "unofficial-flighty-ts",
+  "version": "0.1.0",
+  "description": "Unofficial TypeScript client for the Flighty flight-tracking sync API. Not affiliated with Flighty, Inc.",
+  "license": "MIT",
+  "author": "Martin Amps",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/martinamps/unofficial-flighty-ts.git"
+  },
+  "homepage": "https://github.com/martinamps/unofficial-flighty-ts#readme",
+  "bugs": {
+    "url": "https://github.com/martinamps/unofficial-flighty-ts/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "flighty-creds": "./dist/bin/creds.js"
+  },
+  "sideEffects": false,
+  "files": ["dist", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/bin/creds.js",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "bun test",
+    "clean": "rm -rf dist",
+    "creds": "bun src/bin/creds.ts",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "flighty",
+    "flights",
+    "flight-tracking",
+    "aviation",
+    "api",
+    "unofficial"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
