@@ -1,6 +1,6 @@
 {
   "name": "unofficial-flighty-ts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Unofficial TypeScript client for the Flighty flight-tracking sync API. Not affiliated with Flighty, Inc.",
   "license": "MIT",
   "author": "Martin Amps",
