@@ -1,5 +1,11 @@
 export { FlightyClient, resolveFlight } from "./client.js";
-export type { FlightyClientOptions, RetryOptions, SyncOptions } from "./client.js";
+export type {
+  FlightyClientOptions,
+  RetryOptions,
+  RouteSearchOptions,
+  SubscribeOptions,
+  SyncOptions,
+} from "./client.js";
 export { FlightyApiError, FlightyError, FlightyTransportError } from "./errors.js";
 export { computeStats } from "./stats.js";
 export type {
@@ -24,9 +30,13 @@ export type {
   Entity,
   FaaTmi,
   Flight,
+  FlightCore,
+  FlightDetails,
   FlightEvent,
+  FlightSearchResult,
   GateChangeEvent,
   InboundFlight,
+  InlinedCatalog,
   MetropolitanArea,
   ResolvedFlight,
   SyncResult,

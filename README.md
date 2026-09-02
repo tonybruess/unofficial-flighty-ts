@@ -190,6 +190,60 @@ streams in, so you can persist progress even if the stream is
 interrupted. Unlike `sync()`, `stream()` does not throw if `maxPages`
 is reached — it simply stops yielding.
 
+### `client.search(options): Promise<FlightSearchResult[]>`
+
+Looks up scheduled flights between two airports on a date — the same
+call the app's "Add Flight → Route" picker makes. Airports are
+addressed by Flighty id (`Airport.id`), not IATA; get them from a sync.
+
+```ts
+const sync = await client.sync();
+const byIata = (code: string) =>
+  [...sync.airports.values()].find((a) => a.iata === code)!;
+
+const rows = await client.search({
+  departureAirportId: byIata("LHR").id,
+  arrivalAirportId: byIata("EWR").id,
+  date: "2026-09-03", // YYYY-MM-DD, local to the departure airport
+});
+for (const r of rows) {
+  console.log(r.id, `${r.airline?.iata}${r.number}`, r.scheduledDepartureTime);
+}
+```
+
+Flighty returns **one row per marketing flight number**, so a single
+codeshared departure shows up several times (UA123, AC5424, LH7753, …)
+each with its own `id`. Rows are hydrated: `airline`,
+`departureAirport`, `arrivalAirport`, and `scheduledArrivalAirport`
+are inlined, and every airline/airport mentioned anywhere in the row
+(codeshare marketers, inbound legs) sits in `r.airlines` / `r.airports`
+keyed by id. The rest of the row is the same `FlightCore` shape as a
+synced `Flight` — times, gates, aircraft, weather, codeshares,
+`delayForecast`, `inboundFlights` — minus the per-viewer fields.
+
+Only route search is implemented; the flight-number variant of the
+request hasn't been captured yet.
+
+### `client.subscribeFlight(flightId, options?): Promise<FlightDetails>`
+
+Adds a flight from `search()` to the account and returns its full
+record. **This has a side effect**: it's how the app tracks a flight,
+and there is no read-only lookup by id, so the flight will appear in
+the next `sync()`. Re-subscribing an already-tracked flight is
+idempotent.
+
+```ts
+const flight = await client.subscribeFlight(rows[0].id);
+// or track without claiming it as yours:
+const watched = await client.subscribeFlight(rows[0].id, { isPassenger: false });
+
+console.log(flight.isMyFlight, flight.userId === client.myUserId);
+console.log(flight.departureAirport?.displayName, "→", flight.arrivalAirport?.displayName);
+```
+
+The result is a `Flight` (with `userId`, `isMyFlight`, `sharingUrl`,
+…) plus the same inlined catalog fields as a search row.
+
 ### `computeStats(sync, options?): FlightyStats`
 
 Aggregates a `SyncResult` into the same buckets the Flighty app's
@@ -229,6 +283,12 @@ leg) so you can walk multi-leg itineraries without rescanning
 
 What's pulled off the wire per entity:
 
+- **FlightSearchResult** / **FlightDetails** — a `Flight` core as
+  returned by `search()` / `subscribeFlight()`, plus inlined `airline`,
+  `departureAirport`, `arrivalAirport`, `scheduledArrivalAirport`, and
+  `airlines` / `airports` maps of every catalog record embedded in the
+  payload. Search rows omit the per-viewer fields (`userId`,
+  `isMyFlight`, …); subscribe results include them.
 - **Flight** — `id`, `userId`, `number`, `callsign`, `airlineId`,
   `departureAirportId`, `arrivalAirportId`, `scheduledArrivalAirportId`
   (differs from `arrivalAirportId` only on diverted flights),
@@ -347,6 +407,10 @@ accepted per-call on `client.sync({ onlyMine: true })` and
 - `delayForecast` exposes observation count and mean delay; the
   per-bucket histogram is on the wire but its bucket schema doesn't
   cleanly sum to observations, so it's left for future work.
+- `search()` only speaks the route variant of Flighty's search request.
+  Searching by flight number, and the live-position poll
+  (`/v1/sync/content/flight/{id}`) that feeds the in-app map, aren't
+  wrapped yet.
 - Eight of Flighty's ~20 entity kinds are surfaced (flights, airports,
   airlines, aircraft types, tickets, metropolitan areas, user profiles,
   connections). Subscriptions, friend-request pairings, user settings,

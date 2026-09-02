@@ -322,14 +322,14 @@ export interface Ticket {
   readonly lastUpdated: Date | null;
 }
 
-export interface Flight {
-  readonly kind: "flight";
+/**
+ * Operational fields of a flight — everything Flighty knows about the
+ * flight itself, independent of which user is looking at it. `Flight`
+ * (from `sync()`) layers the per-viewer fields on top; search results
+ * ship the core alone.
+ */
+export interface FlightCore {
   readonly id: string;
-  /**
-   * Owner — authed user OR a connected friend. Compare against
-   * `FlightyClient.myUserId` to distinguish.
-   */
-  readonly userId: string;
   /** Airline flight number (IATA), e.g. "2123". */
   readonly number: string;
   /** Operational callsign (ICAO), e.g. "UAL1089". */
@@ -376,19 +376,6 @@ export interface Flight {
   readonly distanceKm: number;
   readonly aircraft: Aircraft | null;
   readonly isCancelled: boolean;
-  /**
-   * Per-viewer archive flag. Flighty auto-archives completed flights and
-   * hides them from the default "Upcoming" list.
-   */
-  readonly isArchived: boolean;
-  /**
-   * Per-viewer flag for "a flight I actually took / will take". Distinct
-   * from `userId`: a calendar-imported row can land on the account with
-   * `isMyFlight = false` until the user confirms it.
-   */
-  readonly isMyFlight: boolean;
-  /** Public share link (`https://live.flighty.app/...`) if the owner enabled it. */
-  readonly sharingUrl: string | null;
   /** Observed conditions at the departure airport (OWM-sourced). */
   readonly departureWeather: Weather | null;
   /** Forecast conditions at the arrival airport. */
@@ -414,21 +401,82 @@ export interface Flight {
    * Previous rotations of the same aircraft, oldest → newest. Usually 0-1.
    */
   readonly inboundFlights: InboundFlight[];
+  /** When Flighty first created this record. */
+  readonly created: Date | null;
+  /** When Flighty last updated this record on the server. */
+  readonly lastUpdated: Date | null;
+}
+
+export interface Flight extends FlightCore {
+  readonly kind: "flight";
+  /**
+   * Owner — authed user OR a connected friend. Compare against
+   * `FlightyClient.myUserId` to distinguish.
+   */
+  readonly userId: string;
+  /**
+   * Per-viewer archive flag. Flighty auto-archives completed flights and
+   * hides them from the default "Upcoming" list.
+   */
+  readonly isArchived: boolean;
+  /**
+   * Per-viewer flag for "a flight I actually took / will take". Distinct
+   * from `userId`: a calendar-imported row can land on the account with
+   * `isMyFlight = false` until the user confirms it.
+   */
+  readonly isMyFlight: boolean;
+  /** Public share link (`https://live.flighty.app/...`) if the owner enabled it. */
+  readonly sharingUrl: string | null;
   /**
    * Raw import-source wire code (`manual` / `email` / `calendar` / `friend`
    * / `shared` are the suspected labels; integer→string mapping unverified).
    */
   readonly importSourceRaw: number | null;
-  /** When Flighty first created this record. */
-  readonly created: Date | null;
-  /** When Flighty last updated this record on the server. */
-  readonly lastUpdated: Date | null;
   /**
    * Tombstone timestamp; `null` for live records. Filtered by default —
    * pass `{ includeDeleted: true }` to `sync()` to keep tombstones.
    */
   readonly deletedAt: Date | null;
 }
+
+/**
+ * Catalog records Flighty inlines into search and subscribe responses
+ * instead of referencing them by id (the sync feed does the opposite).
+ */
+export interface InlinedCatalog {
+  /** Operating carrier. */
+  readonly airline: Airline | null;
+  readonly departureAirport: Airport | null;
+  /** Actual (or currently scheduled) arrival airport. */
+  readonly arrivalAirport: Airport | null;
+  /** Differs from `arrivalAirport` only on diverted flights. */
+  readonly scheduledArrivalAirport: Airport | null;
+  /**
+   * Every airline inlined anywhere in the payload — operating carrier,
+   * codeshare marketers, inbound-leg carriers — keyed by id. Resolves
+   * `Codeshare.airlineId` and `InboundFlight.airlineId` without a sync.
+   */
+  readonly airlines: Map<string, Airline>;
+  /** Every airport inlined anywhere in the payload, keyed by id. */
+  readonly airports: Map<string, Airport>;
+}
+
+/**
+ * One row from `client.search()`. Flighty returns a separate row per
+ * marketing flight number, so a single physical departure shows up once
+ * per codeshare (UA123, AC5424, LH7753, …), each with its own `id`. Pass
+ * the `id` to `client.subscribeFlight()` to add it to the account.
+ */
+export interface FlightSearchResult extends FlightCore, InlinedCatalog {
+  readonly kind: "flightSearchResult";
+}
+
+/**
+ * The flight record `client.subscribeFlight()` returns: the same
+ * per-viewer `Flight` the next `sync()` will contain, plus the inlined
+ * catalog objects so it's usable without a sync.
+ */
+export interface FlightDetails extends Flight, InlinedCatalog {}
 
 export type Entity =
   | Airport

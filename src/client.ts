@@ -1,5 +1,11 @@
+import { concat, lengthDelimited } from "./encode.js";
 import { FlightyApiError, FlightyError, FlightyTransportError } from "./errors.js";
-import { decodeEntities, extractNextUrl } from "./parse.js";
+import {
+  decodeEntities,
+  decodeSearchResponse,
+  decodeSubscribeResponse,
+  extractNextUrl,
+} from "./parse.js";
 import type {
   AircraftType,
   Airline,
@@ -7,6 +13,8 @@ import type {
   Connection,
   Entity,
   Flight,
+  FlightDetails,
+  FlightSearchResult,
   MetropolitanArea,
   ResolvedFlight,
   SyncResult,
@@ -84,6 +92,32 @@ export interface SyncOptions {
   readonly signal?: AbortSignal;
 }
 
+/** Search for scheduled flights between two airports on a given date. */
+export interface RouteSearchOptions {
+  /** Departure airport id (`Airport.id`, not IATA). */
+  readonly departureAirportId: string;
+  /** Arrival airport id (`Airport.id`, not IATA). */
+  readonly arrivalAirportId: string;
+  /**
+   * Departure date as `YYYY-MM-DD`, in the departure airport's local
+   * calendar (what the app sends when you pick a day in the picker).
+   */
+  readonly date: string;
+  /** Overrides the client-level `signal`. */
+  readonly signal?: AbortSignal;
+}
+
+export interface SubscribeOptions {
+  /**
+   * `true` (default) marks the flight as one you're flying — it lands in
+   * "My Flights" with `isMyFlight = true`. `false` tracks it without
+   * claiming it (the app's "just watching" mode).
+   */
+  readonly isPassenger?: boolean;
+  /** Overrides the client-level `signal`. */
+  readonly signal?: AbortSignal;
+}
+
 const DEFAULT_BASE_URL = "https://api.flightyapp.com";
 const DEFAULT_MAX_PAGES = 500;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -92,6 +126,9 @@ const DEFAULT_BACKOFF_MS = 500;
 const DEFAULT_BACKOFF_FACTOR = 2;
 const DEFAULT_MAX_BACKOFF_MS = 8_000;
 const SYNC_PATH = "/v1/sync/full";
+const SEARCH_PATH = "/v1/search";
+const EMPTY_BODY = new Uint8Array(0);
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 export class FlightyClient {
   readonly #bearer: string;
@@ -244,6 +281,50 @@ export class FlightyClient {
   }
 
   /**
+   * Find scheduled flights between two airports on a date. Flighty returns
+   * one row per marketing flight number, so a codeshared departure appears
+   * several times with distinct ids — pick the carrier you booked with and
+   * pass its `id` to {@link subscribeFlight}. Airport ids come from
+   * `sync().airports` (match on `iata`).
+   */
+  async search(options: RouteSearchOptions): Promise<FlightSearchResult[]> {
+    if (!options.departureAirportId) throw new FlightyError("departureAirportId is required");
+    if (!options.arrivalAirportId) throw new FlightyError("arrivalAirportId is required");
+    if (!DATE_RE.test(options.date)) {
+      throw new FlightyError(`date must be YYYY-MM-DD, got ${JSON.stringify(options.date)}`);
+    }
+    const body = encodeRouteSearch(options);
+    const buf = await this.#request(`${this.#baseUrl}${SEARCH_PATH}`, body, options.signal);
+    return decodeSearchResponse(buf);
+  }
+
+  /**
+   * Add a flight to the authed account and return its full record. This
+   * is how the app "gets" a flight — there is no read-only lookup by id —
+   * so calling it has the side effect of tracking the flight (it will
+   * appear in the next `sync()`). Subscribing to an already-tracked flight
+   * is idempotent. The returned record inlines airports and airlines so
+   * it's usable without a sync.
+   */
+  async subscribeFlight(flightId: string, options?: SubscribeOptions): Promise<FlightDetails> {
+    if (!flightId) throw new FlightyError("flightId is required");
+    const isPassenger = options?.isPassenger ?? true;
+    // Query string mirrors the app byte-for-byte, including the bare `source`.
+    const url =
+      `${this.#baseUrl}/v1/flight/${encodeURIComponent(flightId)}/subscribe` +
+      `?is_passenger=${isPassenger}&source`;
+    const buf = await this.#request(url, EMPTY_BODY, options?.signal);
+    const flight = decodeSubscribeResponse(buf);
+    if (!flight) throw new FlightyError(`subscribe returned no flight for ${flightId}`);
+    return flight;
+  }
+
+  /** Single-shot POST with the same retry/timeout/abort policy as page fetches. */
+  #request(url: string, body: Uint8Array, signal: AbortSignal | undefined): Promise<Uint8Array> {
+    return this.#fetchPage(url, 1, signal ?? this.#signal, body);
+  }
+
+  /**
    * Yield entities as pages arrive. Low-memory counterpart to `sync()`:
    * applies the same filters but can't dedupe — the latest revision of
    * an id wins eventually, but earlier revisions may have already been
@@ -328,6 +409,7 @@ export class FlightyClient {
     url: string,
     page: number,
     callerSignal: AbortSignal | undefined,
+    body: Uint8Array = EMPTY_BODY,
   ): Promise<Uint8Array> {
     const totalAttempts = this.#retry.retries + 1;
     let lastError: unknown;
@@ -342,7 +424,7 @@ export class FlightyClient {
         );
       }
       try {
-        return await this.#fetchOnce(url, page, callerSignal);
+        return await this.#fetchOnce(url, page, callerSignal, body);
       } catch (err) {
         lastError = err;
         // Caller aborted mid-attempt: wrap the reason and stop retrying.
@@ -374,6 +456,7 @@ export class FlightyClient {
     url: string,
     page: number,
     callerSignal: AbortSignal | undefined,
+    body: Uint8Array,
   ): Promise<Uint8Array> {
     const controller = new AbortController();
     const abortFromCaller = () =>
@@ -396,7 +479,7 @@ export class FlightyClient {
           "Content-Type": "application/x-protobuf",
           Accept: "application/x-protobuf",
         },
-        body: new Uint8Array(0),
+        body,
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -409,6 +492,22 @@ export class FlightyClient {
       if (callerSignal) callerSignal.removeEventListener("abort", abortFromCaller);
     }
   }
+}
+
+// SearchRequestProto: field 2 = route query { 1: { 1: { 1: depId } },
+// 2: { 1: { 1: arrId } } }, field 3 = date, field 4 = "ROUTE". Field 1
+// is unused in captures (presumably the flight-number variant).
+function encodeRouteSearch(options: RouteSearchOptions): Uint8Array {
+  const airportRef = (id: string) => lengthDelimited(1, lengthDelimited(1, id));
+  const route = concat([
+    lengthDelimited(1, airportRef(options.departureAirportId)),
+    lengthDelimited(2, airportRef(options.arrivalAirportId)),
+  ]);
+  return concat([
+    lengthDelimited(2, route),
+    lengthDelimited(3, options.date),
+    lengthDelimited(4, "ROUTE"),
+  ]);
 }
 
 function acceptAll(_entity: Entity): boolean {

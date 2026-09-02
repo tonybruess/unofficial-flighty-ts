@@ -10,8 +10,12 @@ import type {
   Entity,
   FaaTmi,
   Flight,
+  FlightCore,
+  FlightDetails,
   FlightEvent,
+  FlightSearchResult,
   InboundFlight,
+  InlinedCatalog,
   MetropolitanArea,
   Ticket,
   UserProfile,
@@ -263,12 +267,97 @@ function cabinClassFromCode(code: number | null): import("./types.js").CabinClas
   }
 }
 
-function parseFlight(buf: Uint8Array): Flight | null {
+function parseFlight(buf: Uint8Array, catalog?: Catalog): Flight | null {
   const m = new Message(buf);
   const id = m.str(1);
   const core = m.sub(2);
   if (!id || !core) return null;
+  return {
+    kind: "flight",
+    ...parseFlightCore(id, core, catalog),
+    userId: m.str(9) ?? "",
+    isArchived: m.bool(3) ?? false,
+    isMyFlight: m.bool(5) ?? false,
+    sharingUrl: m.str(10),
+    importSourceRaw: m.int(7),
+    deletedAt: toDate(m.sub(13)?.int(1) ?? null),
+  };
+}
 
+/**
+ * Airports/airlines inlined into search + subscribe payloads, keyed by
+ * id. The sync feed references catalogs by id instead, so `parseFlightCore`
+ * accepts either layout: reference fields win when present, otherwise
+ * the id is lifted off the inlined record (which is also collected here).
+ */
+interface Catalog {
+  readonly airports: Map<string, Airport>;
+  readonly airlines: Map<string, Airline>;
+}
+
+function newCatalog(): Catalog {
+  return { airports: new Map(), airlines: new Map() };
+}
+
+function inlinedAirportId(m: Message | undefined, tag: number, catalog: Catalog | undefined): string | null {
+  const bytes = m?.bytes(tag);
+  if (!bytes) return null;
+  const airport = parseAirport(bytes);
+  if (!airport) return null;
+  catalog?.airports.set(airport.id, airport);
+  return airport.id;
+}
+
+function inlinedAirlineId(m: Message | undefined, tag: number, catalog: Catalog | undefined): string | null {
+  const bytes = m?.bytes(tag);
+  if (!bytes) return null;
+  const airline = parseAirline(bytes);
+  if (!airline) return null;
+  catalog?.airlines.set(airline.id, airline);
+  return airline.id;
+}
+
+/**
+ * Decode `/v1/search` — a list of hydrated flight cores, one per
+ * marketing flight number.
+ */
+export function decodeSearchResponse(buf: Uint8Array): FlightSearchResult[] {
+  const results: FlightSearchResult[] = [];
+  const list = new Message(buf).sub(2);
+  if (!list) return results;
+  for (const core of list.subs(1)) {
+    const id = core.str(1);
+    if (!id) continue;
+    const catalog = newCatalog();
+    const parsed = parseFlightCore(id, core, catalog);
+    results.push({ kind: "flightSearchResult", ...parsed, ...inlinedCatalog(parsed, catalog) });
+  }
+  return results;
+}
+
+/** Decode `/v1/flight/{id}/subscribe` — a single hydrated `Flight`. */
+export function decodeSubscribeResponse(buf: Uint8Array): FlightDetails | null {
+  const entity = new Message(buf).bytes(1);
+  if (!entity) return null;
+  const catalog = newCatalog();
+  const flight = parseFlight(entity, catalog);
+  if (!flight) return null;
+  return { ...flight, ...inlinedCatalog(flight, catalog) };
+}
+
+function inlinedCatalog(core: FlightCore, catalog: Catalog): InlinedCatalog {
+  const lookupAirport = (id: string | null) => (id ? (catalog.airports.get(id) ?? null) : null);
+  return {
+    airline: core.airlineId ? (catalog.airlines.get(core.airlineId) ?? null) : null,
+    departureAirport: lookupAirport(core.departureAirportId),
+    arrivalAirport: lookupAirport(core.arrivalAirportId),
+    scheduledArrivalAirport: lookupAirport(core.scheduledArrivalAirportId),
+    airlines: catalog.airlines,
+    airports: catalog.airports,
+  };
+}
+
+function parseFlightCore(id: string, core: Message, catalog: Catalog | undefined): FlightCore {
   const dep = core.sub(2);
   const arr = core.sub(3);
   const ac = core.sub(7);
@@ -281,7 +370,7 @@ function parseFlight(buf: Uint8Array): Flight | null {
   let departureWeather: Weather | null = null;
   let depTiming: TimingValues = EMPTY_TIMING;
   if (dep) {
-    departureAirportId = dep.str(11);
+    departureAirportId = dep.str(11) ?? inlinedAirportId(dep, 1, catalog);
     depTiming = readTiming(dep.sub(4));
     departureTerminal = dep.str(2);
     departureGate = dep.str(3);
@@ -298,8 +387,8 @@ function parseFlight(buf: Uint8Array): Flight | null {
   let arrivalWeather: Weather | null = null;
   let arrTiming: TimingValues = EMPTY_TIMING;
   if (arr) {
-    scheduledArrivalAirportId = arr.str(13);
-    arrivalAirportId = arr.str(14) ?? scheduledArrivalAirportId;
+    scheduledArrivalAirportId = arr.str(13) ?? inlinedAirportId(arr, 1, catalog);
+    arrivalAirportId = arr.str(14) ?? inlinedAirportId(arr, 2, catalog) ?? scheduledArrivalAirportId;
     arrTiming = readTiming(arr.sub(7));
     arrivalTerminal = arr.str(3);
     arrivalGate = arr.str(4);
@@ -328,21 +417,25 @@ function parseFlight(buf: Uint8Array): Flight | null {
   const codeshares: Codeshare[] = core.subs(6).flatMap((cs) => {
     const number = cs.str(2);
     return number
-      ? [{ number, airlineId: cs.str(4), operatesAircraft: cs.bool(3) ?? false }]
+      ? [
+          {
+            number,
+            airlineId: cs.str(4) ?? inlinedAirlineId(cs, 1, catalog),
+            operatesAircraft: cs.bool(3) ?? false,
+          },
+        ]
       : [];
   });
 
   const events = parseEvents(core.subs(11));
-  const inboundFlights = core.subs(10).flatMap(parseInboundFlight);
+  const inboundFlights = core.subs(10).flatMap((ib) => parseInboundFlight(ib, catalog));
   const faaTmi = parseFaaTmi(core.sub(18));
 
   return {
-    kind: "flight",
     id,
-    userId: m.str(9) ?? "",
     number: core.str(16) ?? "",
     callsign: core.str(8),
-    airlineId: core.str(21),
+    airlineId: core.str(21) ?? inlinedAirlineId(core, 4, catalog),
     departureAirportId,
     arrivalAirportId,
     scheduledArrivalAirportId,
@@ -364,9 +457,6 @@ function parseFlight(buf: Uint8Array): Flight | null {
     distanceKm: core.int(17) ?? 0,
     aircraft,
     isCancelled: core.bool(5) ?? false,
-    isArchived: m.bool(3) ?? false,
-    isMyFlight: m.bool(5) ?? false,
-    sharingUrl: m.str(10),
     departureWeather,
     arrivalWeather,
     delayForecast: parseDelayForecast(core.sub(12)),
@@ -375,14 +465,12 @@ function parseFlight(buf: Uint8Array): Flight | null {
     faaTmiReason: faaTmi?.reason ?? null,
     faaTmi,
     inboundFlights,
-    importSourceRaw: m.int(7),
     created: toDate(core.sub(13)?.int(1) ?? null),
     lastUpdated: toDate(core.sub(14)?.int(1) ?? null),
-    deletedAt: toDate(m.sub(13)?.int(1) ?? null),
   };
 }
 
-function parseInboundFlight(m: Message): InboundFlight[] {
+function parseInboundFlight(m: Message, catalog: Catalog | undefined): InboundFlight[] {
   const id = m.str(1);
   if (!id) return [];
   const dep = m.sub(2);
@@ -390,15 +478,18 @@ function parseInboundFlight(m: Message): InboundFlight[] {
   const airline = m.sub(4);
   const depTiming = readTiming(dep?.sub(4));
   const arrTiming = readTiming(arr?.sub(7));
+  const airlineId = inlinedAirlineId(m, 4, catalog);
+  const scheduledArrivalAirportId = arr?.str(13) ?? inlinedAirportId(arr, 1, catalog);
   return [
     {
       id,
       number: m.str(16) ?? "",
-      airlineId: airline?.str(1) ?? null,
+      airlineId,
       airlineIata: airline?.str(3) ?? null,
       airlineName: airline?.str(2) ?? null,
-      departureAirportId: dep?.str(11) ?? null,
-      arrivalAirportId: arr?.str(14) ?? arr?.str(13) ?? null,
+      departureAirportId: dep?.str(11) ?? inlinedAirportId(dep, 1, catalog),
+      arrivalAirportId:
+        arr?.str(14) ?? inlinedAirportId(arr, 2, catalog) ?? scheduledArrivalAirportId,
       departureTime: toDate(depTiming.best),
       scheduledDepartureTime: toDate(depTiming.scheduled),
       estimatedDepartureTime: toDate(depTiming.estimated),

@@ -162,6 +162,113 @@ export function encodeSyncPage(page: SyncPage): Uint8Array {
   return encodeFields(fields);
 }
 
+export interface AirlineFixture {
+  id: string;
+  iata?: string;
+  name?: string;
+}
+
+export function encodeAirline(a: AirlineFixture): Uint8Array {
+  const fields = [field(1, str(a.id)), field(2, str(a.name ?? ""))];
+  if (a.iata) fields.push(field(3, str(a.iata)));
+  return encodeFields(fields);
+}
+
+/**
+ * A flight as `/v1/search` and `/subscribe` ship it: airports and
+ * airlines inlined as sub-messages instead of referenced by id.
+ */
+export interface HydratedFlightFixture {
+  id: string;
+  number?: string;
+  airline?: AirlineFixture;
+  departureAirport?: AirportFixture;
+  arrivalAirport?: AirportFixture;
+  /** Defaults to `arrivalAirport`; set differently to model a diversion. */
+  scheduledArrivalAirport?: AirportFixture;
+  /** Epoch seconds. */
+  scheduledDeparture?: number;
+  codeshares?: readonly { number: string; airline: AirlineFixture; operatesAircraft?: boolean }[];
+  inboundFlights?: readonly { id: string; number: string; airline: AirlineFixture; departureAirport: AirportFixture }[];
+}
+
+function timestamp(tag: number, seconds: number) {
+  return field(tag, sub(subMessage([field(1, varint(seconds))])));
+}
+
+export function encodeHydratedCore(f: HydratedFlightFixture): Uint8Array {
+  const core = [field(1, str(f.id))];
+  const depFields = [];
+  if (f.departureAirport) depFields.push(field(1, sub(encodeAirport(f.departureAirport))));
+  if (f.scheduledDeparture != null) {
+    depFields.push(field(4, sub(subMessage([timestamp(1, f.scheduledDeparture)]))));
+  }
+  if (depFields.length) core.push(field(2, sub(subMessage(depFields))));
+  if (f.arrivalAirport) {
+    const scheduled = f.scheduledArrivalAirport ?? f.arrivalAirport;
+    core.push(
+      field(
+        3,
+        sub(
+          subMessage([
+            field(1, sub(encodeAirport(scheduled))),
+            field(2, sub(encodeAirport(f.arrivalAirport))),
+          ]),
+        ),
+      ),
+    );
+  }
+  if (f.airline) core.push(field(4, sub(encodeAirline(f.airline))));
+  for (const cs of f.codeshares ?? []) {
+    const csFields = [field(1, sub(encodeAirline(cs.airline))), field(2, str(cs.number))];
+    if (cs.operatesAircraft) csFields.push(field(3, bool(true)));
+    core.push(field(6, sub(subMessage(csFields))));
+  }
+  for (const ib of f.inboundFlights ?? []) {
+    core.push(
+      field(
+        10,
+        sub(
+          subMessage([
+            field(1, str(ib.id)),
+            field(2, sub(subMessage([field(1, sub(encodeAirport(ib.departureAirport)))]))),
+            field(4, sub(encodeAirline(ib.airline))),
+            field(16, str(ib.number)),
+          ]),
+        ),
+      ),
+    );
+  }
+  core.push(field(16, str(f.number ?? "")));
+  return encodeFields(core);
+}
+
+/** `SearchResponseProto`: field 2 wraps repeated cores + per-row sidecars. */
+export function encodeSearchResponse(flights: readonly HydratedFlightFixture[]): Uint8Array {
+  const list = [];
+  for (const f of flights) list.push(field(1, sub(encodeHydratedCore(f))));
+  for (const f of flights) {
+    list.push(field(2, sub(subMessage([field(1, str(f.id)), field(2, varint(0))]))));
+  }
+  return encodeFields([field(2, sub(subMessage(list)))]);
+}
+
+export interface SubscribeFixture extends HydratedFlightFixture {
+  userId: string;
+  isMyFlight: boolean;
+}
+
+/** `SubscribeFlightResponseProto`: field 1 wraps a per-viewer flight entity. */
+export function encodeSubscribeResponse(f: SubscribeFixture): Uint8Array {
+  const entity = subMessage([
+    field(1, str(f.id)),
+    field(2, sub(encodeHydratedCore(f))),
+    field(5, bool(f.isMyFlight)),
+    field(9, str(f.userId)),
+  ]);
+  return encodeFields([field(1, sub(entity))]);
+}
+
 /** Build a base64 cursor from arbitrary JSON-like state. */
 export function buildCursor(payload: Record<string, unknown>): string {
   return btoa(JSON.stringify(payload));
